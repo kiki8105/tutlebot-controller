@@ -23,7 +23,7 @@ from nav_msgs.msg import OccupancyGrid, Path as NavPath
 from nav2_msgs.action import FollowWaypoints
 from nav2_msgs.srv import LoadMap, ManageLifecycleNodes
 from rcl_interfaces.srv import GetParameters, SetParametersAtomically, ListParameters, DescribeParameters
-from rcl_interfaces.msg import Parameter as ParameterMsg
+from rcl_interfaces.msg import Parameter as ParameterMsg, ParameterEvent
 from tf2_ros import Buffer, TransformListener, TransformException
 from tf2_msgs.msg import TFMessage
 
@@ -192,6 +192,7 @@ class RosBridge(QtCore.QObject):
     poseReceived = QtCore.pyqtSignal(object)
     planReceived = QtCore.pyqtSignal(object)
     navStatus = QtCore.pyqtSignal(str)
+    driverStateReceived = QtCore.pyqtSignal(str, object)
 
     def __init__(self, node):
         super().__init__()
@@ -203,6 +204,16 @@ class RosBridge(QtCore.QObject):
         self.cancel_requested = False
         self.maintenance = False
         self.external_active = {}
+        self.autonomous_drivers = {}
+        # Nodes publishing the selected cmd_vel endpoint are authoritative.
+        # Their node namespace may differ from the topic namespace when they
+        # publish an absolute topic (for example /robot1/pure_pursuit ->
+        # /cmd_vel), so retain their exact fully-qualified node names.
+        self.publisher_drivers = set()
+        self.driver_queries = set()
+        self.driver_stop_pending = set()
+        self.driver_generations = {}
+        self.driver_discovery_due = 0.0
         self.pose = None
         # /map은 TRANSIENT_LOCAL로 보통 한 번만 발행된다. 조종기가 나중에
         # 연결되면 MapPanel의 signal 연결보다 먼저 수신될 수 있으므로 보관한다.
@@ -210,12 +221,16 @@ class RosBridge(QtCore.QObject):
         self.frame = 'map'
         self.action = ActionClient(node, FollowWaypoints, self.endpoint('follow_waypoints'))
         self.initial_pub = node.create_publisher(PoseWithCovarianceStamped, self.endpoint('initialpose'), 1)
+        self.goal_pose_pub = node.create_publisher(
+            PoseStamped, self.endpoint('goal_pose'), 1)
         self.buffer = Buffer(node=node)
         self.listener = TransformListener(self.buffer, node, spin_thread=False)
         durable = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                              reliability=ReliabilityPolicy.RELIABLE)
         self.subs = [node.create_subscription(OccupancyGrid, self.endpoint('map'), self.on_map, durable),
-                     node.create_subscription(NavPath, self.endpoint('plan'), self.on_plan, 1)]
+                     node.create_subscription(NavPath, self.endpoint('plan'), self.on_plan, 1),
+                     node.create_subscription(ParameterEvent, '/parameter_events',
+                                              self.on_parameter_event, 100)]
         if self.namespace:
             # Some multi-robot setups share /tf but prefix frame IDs. Only ingest
             # transforms whose child belongs to the selected vehicle.
@@ -228,6 +243,9 @@ class RosBridge(QtCore.QObject):
                 lambda m, name=name: self.on_action_status(name, m), durable))
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.poll)
+        # Parameter events arrive on the ROS executor thread.  Route state
+        # mutations through Qt so GUI reads and writes stay on one thread.
+        self.driverStateReceived.connect(self.set_autonomous_driver_state)
         self.timer.start(100)
 
     def shared_tf(self, msg, static):
@@ -243,8 +261,179 @@ class RosBridge(QtCore.QObject):
         return self.namespace+'/'+name.lstrip('/')
 
     @property
-    def busy(self):
+    def nav_busy(self):
         return self.maintenance or self.pending_goal or self.goal is not None or any(self.external_active.values())
+
+    @property
+    def custom_drive_busy(self):
+        # Unknown is treated as active until the parameter query completes.
+        # This prevents manual /cmd_vel from competing with a newly discovered
+        # autonomous controller.
+        return bool(self.driver_queries or self.driver_stop_pending) or any(
+            enabled is not False for enabled in self.autonomous_drivers.values())
+
+    @property
+    def busy(self):
+        return self.nav_busy or self.custom_drive_busy
+
+    @staticmethod
+    def is_autonomous_driver(node_name):
+        return 'pure_pursuit' in node_name.rsplit('/', 1)[-1]
+
+    def owns_autonomous_driver(self, node_name):
+        """Return whether a driver belongs to the selected robot namespace."""
+        normalized = '/' + node_name.strip('/')
+        if not self.is_autonomous_driver(normalized):
+            return False
+        if self.namespace:
+            return normalized.startswith(self.namespace + '/')
+        # Selecting '/' must not control /robot1, /robot2, ... drivers.
+        return normalized.count('/') == 1
+
+    def tracks_autonomous_driver(self, node_name):
+        """Return whether parameter events belong to the active driver set."""
+        normalized = '/' + node_name.strip('/')
+        if not self.is_autonomous_driver(normalized):
+            return False
+        if self.publisher_drivers:
+            return normalized in self.publisher_drivers
+        return self.owns_autonomous_driver(normalized)
+
+    @QtCore.pyqtSlot(str, object)
+    def set_autonomous_driver_state(self, node_name, enabled):
+        node_name = '/' + node_name.strip('/')
+        if (node_name in self.autonomous_drivers
+                and self.tracks_autonomous_driver(node_name)):
+            self.autonomous_drivers[node_name] = enabled
+
+    def on_parameter_event(self, msg):
+        node_name = '/' + msg.node.strip('/')
+        if not self.tracks_autonomous_driver(node_name):
+            return
+        for parameter in list(msg.new_parameters) + list(msg.changed_parameters):
+            if parameter.name == 'drive_enabled':
+                value = Parameter.from_parameter_msg(parameter).value
+                self.driverStateReceived.emit(node_name, bool(value))
+        if any(parameter.name == 'drive_enabled'
+               for parameter in msg.deleted_parameters):
+            self.driverStateReceived.emit(node_name, None)
+
+    def refresh_autonomous_drivers(self):
+        """Discover Pure Pursuit nodes and query their drive lock."""
+        services = self.node.get_service_names_and_types()
+        suffix = '/set_parameters_atomically'
+        service_type = 'rcl_interfaces/srv/SetParametersAtomically'
+        service_nodes = {
+            name.removesuffix(suffix)
+            for name, types in services
+            if name.endswith(suffix) and service_type in types
+            and self.owns_autonomous_driver(name.removesuffix(suffix))
+        }
+        # A publisher can become visible just before its parameter services.
+        # Treat it as unknown/busy during that graph propagation window.
+        publisher_nodes = set()
+        try:
+            for info in self.node.get_publishers_info_by_topic(
+                    self.endpoint('cmd_vel')):
+                node_name = '/'.join((
+                    info.node_namespace.rstrip('/'), info.node_name))
+                node_name = '/' + node_name.strip('/')
+                if self.is_autonomous_driver(node_name):
+                    publisher_nodes.add(node_name)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        # Exact publishers of the selected velocity topic are the strongest
+        # ownership signal.  Fall back to namespace-scoped parameter services
+        # only while no matching publisher endpoint is visible.
+        if publisher_nodes:
+            self.publisher_drivers = publisher_nodes
+            discovered = publisher_nodes
+        else:
+            self.publisher_drivers = set()
+            discovered = service_nodes
+        for node_name in set(self.autonomous_drivers) - discovered:
+            if node_name in self.driver_stop_pending:
+                continue
+            self.driver_queries.discard(node_name)
+            self.autonomous_drivers.pop(node_name, None)
+            self.driver_generations.pop(node_name, None)
+        for node_name in discovered:
+            if node_name not in self.autonomous_drivers:
+                self.autonomous_drivers[node_name] = None
+                self.driver_generations.setdefault(node_name, 0)
+            if (self.autonomous_drivers[node_name] is None
+                    and node_name not in self.driver_queries
+                    and node_name not in self.driver_stop_pending):
+                self.query_autonomous_driver(node_name)
+
+    def query_autonomous_driver(self, node_name):
+        request = GetParameters.Request()
+        request.names = ['drive_enabled']
+        self.driver_queries.add(node_name)
+        generation = self.driver_generations.get(node_name, 0)
+
+        def done(result, error):
+            self.driver_queries.discard(node_name)
+            if node_name not in self.autonomous_drivers:
+                return
+            # A stop request has priority over an older read even when its Set
+            # response happens to arrive before this Get response.
+            if generation != self.driver_generations.get(node_name, 0):
+                return
+            if error or not result or not result.values:
+                self.autonomous_drivers[node_name] = None
+                return
+            if result.values[0].type == Parameter.Type.NOT_SET.value:
+                self.autonomous_drivers[node_name] = None
+                return
+            value = Parameter.from_parameter_msg(ParameterMsg(
+                name='drive_enabled', value=result.values[0])).value
+            self.autonomous_drivers[node_name] = bool(value)
+
+        self.call(GetParameters, node_name + '/get_parameters', request, done,
+                  timeout=3)
+
+    def disable_autonomous_drive(self):
+        """Atomically disable every discovered Pure Pursuit cmd_vel source."""
+        self.refresh_autonomous_drivers()
+        had_pending = bool(self.driver_stop_pending)
+        targets = [name for name, enabled in self.autonomous_drivers.items()
+                   if enabled is not False
+                   and name not in self.driver_stop_pending]
+        if not targets:
+            return had_pending
+        for node_name in targets:
+            request = SetParametersAtomically.Request()
+            request.parameters = [Parameter(
+                'drive_enabled', value=False).to_parameter_msg()]
+            self.driver_generations[node_name] = (
+                self.driver_generations.get(node_name, 0) + 1)
+            self.autonomous_drivers[node_name] = None
+            self.driver_stop_pending.add(node_name)
+
+            def done(result, error, node_name=node_name):
+                self.driver_stop_pending.discard(node_name)
+                successful = bool(
+                    result and result.result and result.result.successful)
+                self.autonomous_drivers[node_name] = False if successful else None
+                if not successful:
+                    reason = error or (
+                        result.result.reason if result and result.result else
+                        '응답 없음')
+                    self.navStatus.emit(
+                        f'{node_name} 자동주행 정지 실패: {reason}')
+                elif (not self.driver_stop_pending
+                      and self.autonomous_drivers
+                      and all(enabled is False for enabled
+                              in self.autonomous_drivers.values())):
+                    self.navStatus.emit('자동주행 정지 완료: drive_enabled=false')
+
+            self.call(SetParametersAtomically,
+                      node_name + '/set_parameters_atomically', request, done,
+                      timeout=3)
+        self.navStatus.emit(
+            f'자동주행 정지 요청 중: {len(targets)}개 제어 노드')
+        return True
 
     def on_action_status(self, name, msg):
         self.external_active[name] = any(s.status in (1, 2, 3) for s in msg.status_list)
@@ -294,6 +483,10 @@ class RosBridge(QtCore.QObject):
             except TransformException:
                 pass
         self.poseReceived.emit(self.pose)
+        now = time.monotonic()
+        if now >= self.driver_discovery_due:
+            self.driver_discovery_due = now + 1.0
+            self.refresh_autonomous_drivers()
 
     def call(self, kind, name, request, callback, timeout=8):
         client = self.node.create_client(kind, name)
@@ -308,6 +501,26 @@ class RosBridge(QtCore.QObject):
         msg.pose.covariance[0] = msg.pose.covariance[7] = .25
         msg.pose.covariance[35] = .06854
         self.initial_pub.publish(msg)
+
+    def publish_goal_pose(self, point):
+        """Publish one map goal for controllers that subscribe /goal_pose."""
+        x, y, yaw = point
+        msg = PoseStamped()
+        msg.header.frame_id = self.frame
+        msg.header.stamp = self.node.get_clock().now().to_msg()
+        msg.pose.position.x, msg.pose.position.y = float(x), float(y)
+        msg.pose.orientation.z = math.sin(float(yaw) / 2.0)
+        msg.pose.orientation.w = math.cos(float(yaw) / 2.0)
+        if self.node.count_subscribers(self.goal_pose_pub.topic_name) < 1:
+            self.navStatus.emit(
+                'Goal 수신 노드가 없습니다. /goal_pose를 구독하는 주행 '
+                '노드를 먼저 실행하세요.')
+            return False
+        self.goal_pose_pub.publish(msg)
+        self.navStatus.emit(
+            f'Goal 전송: x={x:.2f}, y={y:.2f}, '
+            f'yaw={math.degrees(yaw):.0f}°. 경로 확인 후 drive_enabled=true')
+        return True
 
     def follow(self, points):
         if self.busy:
@@ -363,8 +576,14 @@ class RosBridge(QtCore.QObject):
             self.navStatus.emit('결과 수신 오류: '+str(exc))
 
     def cancel(self):
+        driver_requested = self.disable_autonomous_drive()
+        if not self.nav_busy:
+            if not driver_requested:
+                self.navStatus.emit('활성 이동 명령이 없습니다.')
+            return
         self.cancel_requested = True
-        self.navStatus.emit('Nav2 취소 요청 중 — 종료 확인 전 수동 이동 잠금')
+        self.navStatus.emit(
+            'Nav2 취소 요청 중 — 종료 확인 전 수동 이동 잠금')
         for name in ('navigate_to_pose', 'navigate_through_poses', 'follow_waypoints'):
             self.call(CancelGoal, self.endpoint(name+'/_action/cancel_goal'), CancelGoal.Request(),
                       lambda result, error: self.navStatus.emit('취소 응답: '+error) if error else None)
@@ -378,7 +597,7 @@ def make_button(text, callback):
 
 class MapPanel(QtWidgets.QGroupBox):
     def __init__(self, bridge, stop_manual, domain=None):
-        super().__init__('3. 지도 · 웨이포인트')
+        super().__init__('3. 지도 · 목표 / 웨이포인트')
         self.bridge = bridge
         self.stop_manual = stop_manual
         self.domain = domain
@@ -389,6 +608,11 @@ class MapPanel(QtWidgets.QGroupBox):
         self.live = False
         self.loading = False
         self.require_initial = False
+        # HOME is the map-frame pose at which the current run starts.  It is
+        # set explicitly with Initial Pose, or lazily from TF when the first
+        # V3 goal is sent.  Keep it in the controller so a HOME request is
+        # still available after the V3 node has discarded its current path.
+        self.home_pose = None
         self.view = MapView()
         self.status = QtWidgets.QLabel('Nav2를 실행하면 /map을 표시합니다.')
         self.status.setWordWrap(True)
@@ -403,7 +627,7 @@ class MapPanel(QtWidgets.QGroupBox):
         layout.addLayout(row)
         row = QtWidgets.QHBoxLayout()
         self.mode = QtWidgets.QComboBox()
-        self.mode.addItems(['화면 이동', '초기 위치 지정', '경유점 추가'])
+        self.mode.addItems(['화면 이동', '초기 위치 지정', '목표 / 경유점 추가'])
         self.mode.currentIndexChanged.connect(self.set_mode)
         row.addWidget(self.mode)
         row.addWidget(self.count_label)
@@ -412,7 +636,10 @@ class MapPanel(QtWidgets.QGroupBox):
         layout.addLayout(row)
         layout.addWidget(self.view, 1)
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(make_button('경유점 순회 시작', self.start_route))
+        row.addWidget(make_button('Goal 전송', self.start_v3_goal))
+        self.home_button = make_button('HOME 복귀', self.return_home)
+        row.addWidget(self.home_button)
+        row.addWidget(make_button('경로점 순회 시작', self.start_route))
         row.addWidget(make_button('이동 취소', self.cancel))
         layout.addLayout(row)
         layout.addWidget(self.pose_status)
@@ -446,8 +673,14 @@ class MapPanel(QtWidgets.QGroupBox):
     def on_map(self, data):
         self.latest_map = data
         if self.import_path is None:
-            if self.view.data and (self.view.data.frame != data.frame or self.view.data.origin != data.origin or self.view.data.resolution != data.resolution):
+            previous = self.view.data
+            map_changed = previous and (
+                previous.frame != data.frame
+                or previous.resolution != data.resolution)
+            if map_changed:
                 self.view.waypoints = []
+                self.home_pose = None
+                self.require_initial = True
             self.live = True
             self.view.set_map(data)
             self.count_label.setText(f'경유점 {len(self.view.waypoints)}개')
@@ -501,6 +734,8 @@ class MapPanel(QtWidgets.QGroupBox):
                 self.status.setText('지도 적용 실패: '+(error or str(result.result)))
                 return
             self.import_path = None
+            self.view.waypoints = []
+            self.home_pose = None
             self.require_initial = True
             self.on_map(MapData.from_msg(result.map))
             self.status.setText('지도 적용 완료. 초기 위치를 다시 지정하세요.')
@@ -531,8 +766,11 @@ class MapPanel(QtWidgets.QGroupBox):
             return
         if self.view.mode == 'initial' and self.bridge:
             self.bridge.initial_pose(x, y, yaw)
+            self.home_pose = (float(x), float(y), float(yaw))
             self.require_initial = False
-            self.status.setText(f'초기 위치 전송: ({x:.2f}, {y:.2f}). 로봇 표시를 확인하세요.')
+            self.status.setText(
+                f'초기 위치/HOME 전송: ({x:.2f}, {y:.2f}). '
+                '로봇 표시를 확인하세요.')
         elif self.view.mode == 'goal':
             self.view.waypoints.append((x, y, yaw))
             self.count_label.setText(f'경유점 {len(self.view.waypoints)}개')
@@ -560,6 +798,43 @@ class MapPanel(QtWidgets.QGroupBox):
             self.bridge.follow(list(self.view.waypoints))
         elif not self.view.waypoints:
             self.status.setText('경유점을 먼저 추가하세요.')
+
+    def start_v3_goal(self):
+        """Send the most recently selected map point on /goal_pose."""
+        self.stop_manual()
+        if self.require_initial:
+            self.status.setText('지도를 변경했습니다. 초기 위치를 먼저 지정하세요.')
+            return
+        if self.editable() and self.bridge and self.live and self.view.waypoints:
+            if self.home_pose is None:
+                pose = getattr(self.bridge, 'pose', None)
+                if pose is None:
+                    self.status.setText(
+                        'HOME 위치를 정할 수 없습니다. 로봇 TF 수신 후 다시 '
+                        'Goal을 전송하거나 초기 위치를 지정하세요.')
+                    return
+                self.home_pose = tuple(float(value) for value in pose)
+            self.bridge.publish_goal_pose(self.view.waypoints[-1])
+        elif not self.view.waypoints:
+            self.status.setText('목표점을 먼저 추가하세요.')
+
+    def return_home(self):
+        """Replace the current V3 goal with the recorded start pose."""
+        self.stop_manual()
+        if self.require_initial:
+            self.status.setText('지도를 변경했습니다. 초기 위치를 먼저 지정하세요.')
+            return
+        if not self.editable() or not self.bridge or not self.live:
+            return
+        if self.home_pose is None:
+            self.status.setText(
+                'HOME 위치 없음: 초기 위치를 지정하거나 로봇 TF 수신 후 '
+                '첫 Goal을 전송하세요.')
+            return
+        if self.bridge.publish_goal_pose(self.home_pose) is False:
+            return
+        x, y, _ = self.home_pose
+        self.status.setText(f'HOME 복귀 목표 전송: x={x:.2f}, y={y:.2f}')
 
     def cancel(self):
         self.stop_manual()
@@ -631,10 +906,14 @@ PARAMETER_GUIDES = {
         'Pure Pursuit가 경유점 도착으로 인정하는 반경입니다.',
         '높이면 쉽게 다음 점으로 넘어가고, 낮추면 더 정확히 접근합니다.',
         'House 실습: 0.15~0.25', 'm'),
+    'goal_topic': (
+        '지도에서 선택한 단일 Goal/HOME PoseStamped를 받을 토픽입니다.',
+        '기본값 /goal_pose를 바꾸면 조종기와 주행 노드가 같은 토픽을 사용해야 합니다.',
+        'TurtleBot3 실습 기본값: /goal_pose', ''),
     'pose_timeout': (
         '위치 입력이 끊긴 뒤 정지할 때까지 기다리는 시간입니다.',
         'V3는 AMCL 갱신 사이를 odom으로 보간하므로 odom까지 끊겼을 때 이 제한이 작동합니다.',
-        'V2: 0(검사 안 함) · V3: 1.0', 's'),
+        'V2: 0(검사 안 함) · Goal: 1.0', 's'),
     'odom_topic': (
         'AMCL 갱신 사이의 상대 이동을 받을 Odometry 토픽입니다.',
         '실제 로봇과 Gazebo 모두 보통 /odom을 사용하며 변경 후 노드를 재시작해야 합니다.',
@@ -666,11 +945,11 @@ PARAMETER_GUIDES = {
     'emergency_stop_distance': (
         '전방 장애물 때문에 전진 속도를 즉시 0으로 만드는 긴급 거리입니다.',
         '높이면 일찍 멈추고, 낮추면 충돌 여유가 줄어듭니다.',
-        'V3 시작값: 0.12 (차체 앞면 기준)', 'm'),
+        'Goal 시작값: 0.12 (차체 앞면 기준)', 'm'),
     'front_stop_distance': (
         '전방 장애물을 만나 회피 선회를 시작하는 거리입니다.',
         '높이면 넓게 피하고, 낮추면 장애물에 더 가까이 접근한 뒤 회피합니다.',
-        'V3 시작값: 0.30 (차체 앞면 기준)', 'm'),
+        'Goal 시작값: 0.30 (차체 앞면 기준)', 'm'),
     'front_clear_distance': (
         '제자리 선회를 끝낼 만큼 전방이 다시 열렸다고 판단하는 거리입니다.',
         '높이면 더 넓은 공간을 확보한 뒤 전진하고, 낮추면 선회를 일찍 끝냅니다.',
@@ -678,7 +957,7 @@ PARAMETER_GUIDES = {
     'front_slow_distance': (
         '전방 장애물에 접근할 때 감속을 시작하는 거리입니다.',
         '높이면 일찍 감속해 안정적이고, 낮추면 장애물 가까이까지 정상 속도를 유지합니다.',
-        'V3 시작값: 0.60 (차체 앞면 기준)', 'm'),
+        'Goal 시작값: 0.60 (차체 앞면 기준)', 'm'),
     'front_corridor_half_width': (
         '로봇 중심선 양옆에서 전방 장애물을 검사할 가상 통로의 반폭입니다.',
         '높이면 차체 옆 장애물에도 민감하고, 낮추면 좁은 통로를 지나기 쉬워집니다.',
@@ -730,7 +1009,7 @@ PARAMETER_GUIDES = {
     'avoidance_retry_limit': (
         '회피 제한 시간을 넘겼을 때 반대 방향으로 다시 시도할 최대 횟수입니다.',
         '높이면 복구 기회가 늘지만 막힌 곳에서 오래 반복할 수 있습니다.',
-        'V3 시작값: 1', '회'),
+        'Goal 시작값: 1', '회'),
     'rejoin_heading_tolerance': (
         '회피 후 목표 방향 추종으로 복귀할 때 허용하는 방향 오차입니다.',
         '높이면 빨리 복귀하고, 낮추면 목표 쪽으로 충분히 정렬한 뒤 복귀합니다.',

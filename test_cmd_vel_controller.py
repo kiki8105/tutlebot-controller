@@ -1,7 +1,8 @@
 import copy
 import unittest
 import tempfile
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 from PyQt5 import QtCore, QtWidgets
 from cmd_vel_controller import Controller, domain_settings, initial_domain
 
@@ -113,6 +114,68 @@ class ControllerTests(unittest.TestCase):
             with self.subTest(button=button.text()):
                 self.assertGreaterEqual(button.height(), 46)
 
+    def test_emergency_stop_cancels_even_when_bridge_reports_idle(self):
+        bridge = SimpleNamespace(busy=False, custom_drive_busy=False,
+                                 cancel=Mock())
+        self.window.bridge = bridge
+        self.addCleanup(setattr, self.window, 'bridge', None)
+
+        self.window.emergency_stop()
+
+        bridge.cancel.assert_called_once_with()
+        self.assert_stopped()
+
+    def test_button_disables_custom_driver_before_manual_motion(self):
+        bridge = SimpleNamespace(
+            busy=True, custom_drive_busy=True,
+            refresh_autonomous_drivers=Mock(),
+            disable_autonomous_drive=Mock(), cancel=Mock())
+        self.window.bridge = bridge
+        self.addCleanup(setattr, self.window, 'bridge', None)
+
+        self.press('forward')
+
+        bridge.disable_autonomous_drive.assert_called_once_with()
+        self.assertIsNone(self.window.active)
+        self.assertTrue(self.pub.messages)
+        self.assertTrue(all(
+            message.linear.x == 0.0 and message.angular.z == 0.0
+            for message in self.pub.messages))
+
+        bridge.custom_drive_busy = False
+        bridge.busy = False
+        self.window.buttons['forward'].setDown(False)
+        self.press('forward')
+        self.assertEqual(self.pub.messages[-1].linear.x, 0.1)
+
+    def test_nav2_busy_blocks_manual_without_disabling_custom_driver(self):
+        bridge = SimpleNamespace(
+            busy=True, custom_drive_busy=False,
+            refresh_autonomous_drivers=Mock(),
+            disable_autonomous_drive=Mock(), cancel=Mock())
+        self.window.bridge = bridge
+        self.addCleanup(setattr, self.window, 'bridge', None)
+
+        self.press('forward')
+
+        bridge.disable_autonomous_drive.assert_not_called()
+        self.assertIsNone(self.window.active)
+        self.assertFalse(self.pub.messages)
+
+    def test_async_busy_transition_clears_latched_manual_velocity(self):
+        bridge = SimpleNamespace(busy=False, custom_drive_busy=False,
+                                 cancel=Mock())
+        self.window.bridge = bridge
+        self.addCleanup(setattr, self.window, 'bridge', None)
+        self.press('forward')
+        self.assertEqual(self.pub.messages[-1].linear.x, 0.1)
+
+        bridge.busy = True
+        self.window.tick()
+
+        self.assert_stopped()
+        self.assertIsNone(self.window.active)
+
 
 if __name__ == '__main__':
     unittest.main()
@@ -178,3 +241,24 @@ class KeyboardTests(ControllerTests):
         self.app.sendEvent(self.window, QtCore.QEvent(QtCore.QEvent.WindowDeactivate))
         self.assert_stopped()
         self.assertFalse(self.window.keys)
+
+    def test_arrow_disables_custom_driver_before_manual_motion(self):
+        bridge = SimpleNamespace(
+            busy=True, custom_drive_busy=True,
+            refresh_autonomous_drivers=Mock(),
+            disable_autonomous_drive=Mock(), cancel=Mock())
+        self.window.bridge = bridge
+        self.addCleanup(setattr, self.window, 'bridge', None)
+
+        self.send_key(QtCore.Qt.Key_Up)
+
+        bridge.disable_autonomous_drive.assert_called_once_with()
+        self.assertFalse(self.window.keys)
+        self.assertTrue(all(message.linear.x == 0.0
+                            for message in self.pub.messages))
+
+        bridge.custom_drive_busy = False
+        bridge.busy = False
+        self.send_key(QtCore.Qt.Key_Up)
+        self.assertEqual(self.pub.messages[-1].linear.x, 0.1)
+        self.send_key(QtCore.Qt.Key_Up, release=True)

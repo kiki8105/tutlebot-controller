@@ -20,10 +20,11 @@ from rclpy.parameter import Parameter
 from nav2_msgs.action import FollowWaypoints
 from nav2_msgs.srv import LoadMap
 from rcl_interfaces.srv import GetParameters
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from tf2_ros import TransformBroadcaster
 
-from navigation_panels import MapData, MapPanel, ParameterPanel, RosBridge, export_parameters
+from navigation_panels import (
+    MapData, MapPanel, ParameterPanel, RosBridge, export_parameters, yaw_of)
 from cmd_vel_controller import Controller
 
 
@@ -93,7 +94,11 @@ class MapTests(unittest.TestCase):
             self.assertEqual(yaml.safe_load(source.read_text()),original)
 
     def test_preview_cannot_send_goal_and_obstacles_rejected(self):
-        bridge=SimpleNamespace(busy=False,follow=Mock(),initial_pose=Mock(),mapReceived=Mock(),poseReceived=Mock(),planReceived=Mock(),navStatus=Mock())
+        bridge=SimpleNamespace(
+            busy=False, pose=(0.0, 0.0, 0.0), follow=Mock(),
+            publish_goal_pose=Mock(),
+            initial_pose=Mock(), mapReceived=Mock(), poseReceived=Mock(),
+            planReceived=Mock(), navStatus=Mock())
         panel=MapPanel(bridge,Mock());panel.view.set_map(MapData([[0,100],[0,0]],1,(0,0,0)))
         panel.view.mode='goal';panel.pick(.5,.5,0)
         self.assertEqual(panel.view.waypoints,[])
@@ -101,8 +106,137 @@ class MapTests(unittest.TestCase):
         self.assertEqual(panel.view.waypoints,[])
         panel.pick(.5,.5,0);panel.start_route()
         bridge.follow.assert_called_once_with([(.5,.5,0)])
+        panel.start_v3_goal()
+        bridge.publish_goal_pose.assert_called_once_with((.5,.5,0))
         panel.require_initial=True;bridge.follow.reset_mock();panel.start_route()
         bridge.follow.assert_not_called()
+
+    def test_home_button_republishes_recorded_initial_pose(self):
+        bridge=SimpleNamespace(
+            busy=False, pose=(4.0, 4.0, 0.0), follow=Mock(),
+            publish_goal_pose=Mock(), initial_pose=Mock(),
+            mapReceived=Mock(), poseReceived=Mock(), planReceived=Mock(),
+            navStatus=Mock())
+        panel=MapPanel(bridge, Mock())
+        panel.view.set_map(MapData([[0, 0], [0, 0]], 1, (0, 0, 0)))
+        panel.live=True
+        panel.view.mode='initial'
+        panel.pick(.5, .5, math.pi/4)
+
+        bridge.initial_pose.assert_called_once_with(.5, .5, math.pi/4)
+        self.assertEqual(panel.home_pose, (.5, .5, math.pi/4))
+        self.assertEqual(panel.home_button.text(), 'HOME 복귀')
+
+        panel.return_home()
+
+        bridge.publish_goal_pose.assert_called_once_with(
+            (.5, .5, math.pi/4))
+        self.assertIn('HOME 복귀 목표 전송', panel.status.text())
+
+    def test_first_v3_goal_uses_current_tf_as_home_fallback(self):
+        bridge=SimpleNamespace(
+            busy=False, pose=(.25, -.5, .1), follow=Mock(),
+            publish_goal_pose=Mock(), initial_pose=Mock(),
+            mapReceived=Mock(), poseReceived=Mock(), planReceived=Mock(),
+            navStatus=Mock())
+        panel=MapPanel(bridge, Mock())
+        panel.view.set_map(MapData([[0, 0], [0, 0]], 1, (0, 0, 0)))
+        panel.live=True
+        panel.view.waypoints=[(1.5, .5, 0.0)]
+
+        panel.start_v3_goal()
+
+        self.assertEqual(panel.home_pose, (.25, -.5, .1))
+        bridge.publish_goal_pose.assert_called_once_with((1.5, .5, 0.0))
+
+    def test_first_v3_goal_without_pose_is_blocked(self):
+        bridge=SimpleNamespace(
+            busy=False, pose=None, follow=Mock(), publish_goal_pose=Mock(),
+            initial_pose=Mock(), mapReceived=Mock(), poseReceived=Mock(),
+            planReceived=Mock(), navStatus=Mock())
+        panel=MapPanel(bridge, Mock())
+        panel.view.set_map(MapData([[0, 0], [0, 0]], 1, (0, 0, 0)))
+        panel.live=True
+        panel.view.waypoints=[(1.5, .5, 0.0)]
+
+        panel.start_v3_goal()
+
+        bridge.publish_goal_pose.assert_not_called()
+        self.assertIsNone(panel.home_pose)
+        self.assertIn('TF', panel.status.text())
+
+    def test_map_frame_change_invalidates_home(self):
+        bridge=SimpleNamespace(
+            busy=False, pose=(0.0, 0.0, 0.0), follow=Mock(),
+            publish_goal_pose=Mock(), initial_pose=Mock(),
+            mapReceived=Mock(), poseReceived=Mock(), planReceived=Mock(),
+            navStatus=Mock())
+        panel=MapPanel(bridge, Mock())
+        panel.on_map(MapData(
+            [[0, 0], [0, 0]], 1, (0, 0, 0), frame='map'))
+        panel.home_pose=(.5, .5, 0.0)
+        panel.view.waypoints=[(1.5, .5, 0.0)]
+
+        panel.on_map(MapData(
+            [[0, 0], [0, 0]], 1, (0, 0, 0), frame='new_map'))
+
+        self.assertIsNone(panel.home_pose)
+        self.assertEqual(panel.view.waypoints, [])
+        self.assertTrue(panel.require_initial)
+        panel.return_home()
+        bridge.publish_goal_pose.assert_not_called()
+
+    def test_slam_origin_and_dimension_growth_keeps_home(self):
+        bridge=SimpleNamespace(
+            busy=False, pose=(0.0, 0.0, 0.0), follow=Mock(),
+            publish_goal_pose=Mock(), initial_pose=Mock(),
+            mapReceived=Mock(), poseReceived=Mock(), planReceived=Mock(),
+            navStatus=Mock())
+        panel=MapPanel(bridge, Mock())
+        panel.on_map(MapData(
+            [[0, 0], [0, 0]], .05, (0, 0, 0)))
+        panel.home_pose=(.5, .5, 0.0)
+        panel.view.waypoints=[(.7, .5, 0.0)]
+
+        panel.on_map(MapData(
+            [[0, 0, 0], [0, 0, 0]], .05, (-1, 0, 0)))
+
+        self.assertEqual(panel.home_pose, (.5, .5, 0.0))
+        self.assertEqual(panel.view.waypoints, [(.7, .5, 0.0)])
+        self.assertFalse(panel.require_initial)
+
+    def test_home_publish_failure_does_not_show_success(self):
+        bridge=SimpleNamespace(
+            busy=False, pose=(0.0, 0.0, 0.0), follow=Mock(),
+            publish_goal_pose=Mock(return_value=False), initial_pose=Mock(),
+            mapReceived=Mock(), poseReceived=Mock(), planReceived=Mock(),
+            navStatus=Mock())
+        panel=MapPanel(bridge, Mock())
+        panel.view.set_map(MapData([[0, 0], [0, 0]], 1, (0, 0, 0)))
+        panel.live=True
+        panel.home_pose=(.5, .5, 0.0)
+        panel.status.setText('/goal_pose 수신 노드가 없습니다.')
+
+        panel.return_home()
+
+        bridge.publish_goal_pose.assert_called_once_with((.5, .5, 0.0))
+        self.assertEqual(panel.status.text(), '/goal_pose 수신 노드가 없습니다.')
+
+    def test_home_button_does_not_capture_current_pose_as_home(self):
+        bridge=SimpleNamespace(
+            busy=False, pose=(3.0, 2.0, .4), follow=Mock(),
+            publish_goal_pose=Mock(), initial_pose=Mock(),
+            mapReceived=Mock(), poseReceived=Mock(), planReceived=Mock(),
+            navStatus=Mock())
+        panel=MapPanel(bridge, Mock())
+        panel.view.set_map(MapData([[0, 0], [0, 0]], 1, (0, 0, 0)))
+        panel.live=True
+
+        panel.return_home()
+
+        bridge.publish_goal_pose.assert_not_called()
+        self.assertIsNone(panel.home_pose)
+        self.assertIn('HOME 위치 없음', panel.status.text())
 
     def test_manual_locked_and_stop_cancels_navigation(self):
         pub=Mock(topic_name='/cmd_vel')
@@ -113,6 +247,7 @@ class MapTests(unittest.TestCase):
             pub.publish.assert_not_called()
             w.emergency_stop();w.bridge.cancel.assert_called_once()
             self.assertEqual(pub.publish.call_args.args[0].linear.x,0)
+            w.bridge.busy=False
             w.close()
 
 
@@ -173,6 +308,7 @@ class RosIntegrationTests(unittest.TestCase):
         for call in self.bridge.calls:self.node.destroy_client(call[0])
         self.bridge.action.destroy();self.bridge.listener.unregister()
         self.node.destroy_publisher(self.bridge.initial_pub)
+        self.node.destroy_publisher(self.bridge.goal_pose_pub)
         self.bridge.deleteLater()
 
     def until(self,predicate,timeout=4):
@@ -202,9 +338,13 @@ class RosIntegrationTests(unittest.TestCase):
     def test_map_import_applies_to_server_and_requires_initial_pose(self):
         panel=MapPanel(self.bridge,Mock())
         panel.import_path='/tmp/isolated-test-map.yaml'
+        panel.home_pose=(1.0, 2.0, 0.0)
+        panel.view.waypoints=[(3.0, 4.0, 0.0)]
         panel.apply_map()
         self.until(lambda:panel.live)
         self.assertEqual(self.maps[-1],'/tmp/isolated-test-map.yaml')
+        self.assertIsNone(panel.home_pose)
+        self.assertEqual(panel.view.waypoints, [])
         self.assertTrue(panel.require_initial)
         panel.pick(.5,.5,0.)
         self.assertFalse(panel.require_initial)
@@ -223,6 +363,7 @@ class RosIntegrationTests(unittest.TestCase):
         try:
             self.assertEqual(bridge.endpoint('follow_waypoints'),'/robot1/follow_waypoints')
             self.assertEqual(bridge.initial_pub.topic_name,'/robot1/initialpose')
+            self.assertEqual(bridge.goal_pose_pub.topic_name,'/robot1/goal_pose')
             self.assertIn('/robot1/map',[sub.topic_name for sub in bridge.subs])
             self.assertNotIn('/robot2/map',[sub.topic_name for sub in bridge.subs])
             panel=ParameterPanel(bridge,213,Mock(),autoload=False)
@@ -246,6 +387,7 @@ class RosIntegrationTests(unittest.TestCase):
             bridge.timer.stop();bridge.action.destroy();bridge.listener.unregister()
             for sub in bridge.subs:client.destroy_subscription(sub)
             client.destroy_publisher(bridge.initial_pub)
+            client.destroy_publisher(bridge.goal_pose_pub)
             self.executor.remove_node(client);client.destroy_node()
             self.server_executor.remove_node(robot1);self.server_executor.remove_node(robot2)
             robot1.destroy_node();robot2.destroy_node()
@@ -282,6 +424,84 @@ class RosIntegrationTests(unittest.TestCase):
         self.bridge.cancel()
         self.until(lambda:'이동 취소 완료' in messages)
         self.until(lambda:not self.bridge.busy)
+
+    def test_goal_pose_without_subscriber_is_rejected(self):
+        messages=[]
+        self.bridge.navStatus.connect(messages.append)
+
+        self.assertFalse(self.bridge.publish_goal_pose((1.0, 2.0, 0.0)))
+
+        self.assertTrue(messages)
+        self.assertIn('수신 노드가 없습니다', messages[-1])
+
+    def test_v3_goal_pose_publisher_uses_last_selected_pose(self):
+        received = []
+        subscription = self.server.create_subscription(
+            PoseStamped, '/goal_pose', received.append, 1)
+        self.addCleanup(lambda: self.server.destroy_subscription(subscription))
+        self.until(lambda: self.node.count_subscribers('/goal_pose') > 0)
+
+        self.assertTrue(self.bridge.publish_goal_pose(
+            (1.25, -0.75, math.pi / 2.0)))
+        self.until(lambda: bool(received))
+
+        message = received[-1]
+        self.assertEqual(message.header.frame_id, 'map')
+        self.assertAlmostEqual(message.pose.position.x, 1.25)
+        self.assertAlmostEqual(message.pose.position.y, -0.75)
+        self.assertAlmostEqual(yaw_of(message.pose.orientation), math.pi / 2.0)
+
+    def test_cancel_disables_only_driver_publishing_selected_cmd_vel(self):
+        selected_driver = rclpy.create_node(
+            'pure_pursuit_v3_node', namespace='/robot1')
+        other_driver = rclpy.create_node(
+            'pure_pursuit_v3_node', namespace='/robot2')
+        selected_driver.declare_parameter('drive_enabled', True)
+        other_driver.declare_parameter('drive_enabled', True)
+        selected_velocity_pub = selected_driver.create_publisher(
+            Twist, '/cmd_vel', 1)
+        other_velocity_pub = other_driver.create_publisher(
+            Twist, '/robot2/cmd_vel', 1)
+        self.server_executor.add_node(selected_driver)
+        self.server_executor.add_node(other_driver)
+        try:
+            self.until(lambda: any(
+                info.node_namespace == '/robot1'
+                and info.node_name == 'pure_pursuit_v3_node'
+                for info in self.node.get_publishers_info_by_topic('/cmd_vel')))
+            self.bridge.refresh_autonomous_drivers()
+            self.until(lambda: self.bridge.autonomous_drivers.get(
+                '/robot1/pure_pursuit_v3_node') is True)
+            self.assertNotIn(
+                '/robot2/pure_pursuit_v3_node',
+                self.bridge.autonomous_drivers)
+            self.assertTrue(self.bridge.custom_drive_busy)
+
+            # Parameter events from an exact topic publisher are accepted even
+            # though its node namespace differs from the selected root topic.
+            selected_driver.set_parameters([
+                Parameter('drive_enabled', value=False)])
+            self.until(lambda: self.bridge.autonomous_drivers.get(
+                '/robot1/pure_pursuit_v3_node') is False)
+            selected_driver.set_parameters([
+                Parameter('drive_enabled', value=True)])
+            self.until(lambda: self.bridge.autonomous_drivers.get(
+                '/robot1/pure_pursuit_v3_node') is True)
+
+            self.bridge.cancel()
+
+            self.until(lambda: selected_driver.get_parameter(
+                'drive_enabled').value is False)
+            self.until(lambda: not self.bridge.custom_drive_busy)
+            self.assertTrue(other_driver.get_parameter(
+                'drive_enabled').value)
+        finally:
+            self.server_executor.remove_node(selected_driver)
+            self.server_executor.remove_node(other_driver)
+            selected_driver.destroy_publisher(selected_velocity_pub)
+            other_driver.destroy_publisher(other_velocity_pub)
+            selected_driver.destroy_node()
+            other_driver.destroy_node()
 
 
 class CameraDecodeTests(unittest.TestCase):

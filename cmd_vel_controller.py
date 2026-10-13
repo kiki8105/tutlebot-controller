@@ -335,10 +335,10 @@ class Controller(QtWidgets.QWidget):
         if editing or event.modifiers() != QtCore.Qt.NoModifier or (
                 obj is not self and obj is not self.controls and not self.controls.isAncestorOf(obj)):
             return False
-        if self.bridge and self.bridge.busy:
-            self.status.setText("Nav2 이동 중: 먼저 정지/취소하세요.")
-            return False
         if kind == QtCore.QEvent.ShortcutOverride:
+            event.accept()
+            return True
+        if not self.manual_drive_ready():
             event.accept()
             return True
         if not event.isAutoRepeat():
@@ -454,14 +454,39 @@ class Controller(QtWidgets.QWidget):
         self.publisher.publish(msg)
 
     def emergency_stop(self):
-        if self.bridge and self.bridge.busy:
-            self.bridge.cancel()
+        if self.bridge:
+            cancel = getattr(self.bridge, 'cancel', None)
+            if callable(cancel):
+                cancel()
         self.stop()
         self.publish()
 
-    def start(self, button, direction):
-        if self.bridge and self.bridge.busy:
+    def manual_drive_ready(self):
+        """Reserve /cmd_vel for manual control before accepting one input."""
+        if not self.bridge:
+            return True
+        refresh = getattr(self.bridge, 'refresh_autonomous_drivers', None)
+        if callable(refresh):
+            refresh()
+        if getattr(self.bridge, 'custom_drive_busy', False) is True:
+            disable = getattr(self.bridge, 'disable_autonomous_drive', None)
+            if callable(disable):
+                disable()
+            self.keys.clear()
+            self.active = None
+            self.direction = (0, 0)
+            self.stop_ticks = 0
+            self.publish()
+            self.status.setText(
+                '자동주행 정지 요청 중: 완료 후 다시 조작하세요.')
+            return False
+        if getattr(self.bridge, 'busy', False):
             self.status.setText('Nav2 이동 중: 먼저 정지/취소하세요.')
+            return False
+        return True
+
+    def start(self, button, direction):
+        if not self.manual_drive_ready():
             return
         self.keys.clear()
         self.active, self.direction = button, direction
@@ -469,19 +494,23 @@ class Controller(QtWidgets.QWidget):
         self.tick()
 
     def stop(self):
+        was_manual = bool(self.keys or self.active is not None)
         self.keys.clear()
         self.active = None
         self.direction = (0, 0)
-        if not self.bridge or not self.bridge.busy:
+        if was_manual or not self.bridge or not self.bridge.busy:
             self.publish()
         self.stop_ticks = 5  # Short stop burst; do not continuously compete when idle.
         self.status.setText('정지')
 
     def tick(self):
         if self.bridge and self.bridge.busy:
+            was_manual = bool(self.keys or self.active is not None)
             self.keys.clear()
             self.active = None
             self.stop_ticks = 0
+            if was_manual:
+                self.publish()
             return
         if self.keys or self.active is not None:
             if not self.keys and not self.active.isDown():
@@ -504,14 +533,16 @@ class Controller(QtWidgets.QWidget):
         super().hideEvent(event)
 
     def closeEvent(self, event):
+        # Discover and stop a custom driver before deciding that the window is
+        # idle.  It may not have appeared in the periodic graph poll yet.
+        self.emergency_stop()
         if self.bridge and self.bridge.busy:
-            self.emergency_stop()
-            self.status.setText('Nav2 취소 요청 중입니다. 취소 완료 후 창을 닫으세요.')
+            self.status.setText(
+                '자동/Nav2 주행 정지 요청 중입니다. 완료 후 창을 닫으세요.')
             event.ignore()
             return
         QtWidgets.QApplication.instance().removeEventFilter(self)
         self.timer.stop()
-        self.emergency_stop()
         event.accept()
 
 
