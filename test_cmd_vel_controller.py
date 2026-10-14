@@ -242,6 +242,14 @@ class KeyboardTests(ControllerTests):
         self.assert_stopped()
         self.assertFalse(self.window.keys)
 
+    def test_arrows_drive_when_map_panel_has_focus(self):
+        self.send_key(QtCore.Qt.Key_Up, target=self.window.map_panel.view)
+
+        self.assertEqual(self.pub.messages[-1].linear.x, 0.1)
+
+        self.send_key(QtCore.Qt.Key_Up, release=True, target=self.window.map_panel.view)
+        self.assert_stopped()
+
     def test_arrow_disables_custom_driver_before_manual_motion(self):
         bridge = SimpleNamespace(
             busy=True, custom_drive_busy=True,

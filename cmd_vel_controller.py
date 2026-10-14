@@ -332,8 +332,7 @@ class Controller(QtWidgets.QWidget):
             return False
         editing = isinstance(obj, (QtWidgets.QLineEdit, QtWidgets.QAbstractSpinBox,
                                    QtWidgets.QComboBox))
-        if editing or event.modifiers() != QtCore.Qt.NoModifier or (
-                obj is not self and obj is not self.controls and not self.controls.isAncestorOf(obj)):
+        if editing or event.modifiers() != QtCore.Qt.NoModifier:
             return False
         if kind == QtCore.QEvent.ShortcutOverride:
             event.accept()

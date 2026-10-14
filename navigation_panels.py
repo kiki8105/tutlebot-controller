@@ -670,6 +670,32 @@ class MapPanel(QtWidgets.QGroupBox):
             return False
         return True
 
+    def goal_editable(self):
+        """Allow V3 goal replacement while a custom driver owns cmd_vel."""
+        if self.loading:
+            self.status.setText('지도 변경 중입니다. 완료 후 Goal을 지정하세요.')
+            return False
+        if self.bridge:
+            # Pure Pursuit keeps drive_enabled=true after reaching a goal so
+            # the next /goal_pose can start without another parameter change.
+            # That makes bridge.busy remain true even while the robot is
+            # stopped.  Only a real Nav2 action/maintenance operation must
+            # lock goal editing; publishing /goal_pose safely replaces the
+            # custom driver's current route and stops it before replanning.
+            nav_busy = getattr(self.bridge, 'nav_busy', None)
+            if nav_busy is None:
+                nav_busy = (
+                    bool(getattr(self.bridge, 'busy', False))
+                    and not bool(getattr(
+                        self.bridge, 'custom_drive_busy', False))
+                )
+            if nav_busy:
+                self.status.setText(
+                    'Nav2 이동 중입니다. 완료 또는 취소 후 Goal을 '
+                    '지정하세요.')
+                return False
+        return True
+
     def on_map(self, data):
         self.latest_map = data
         if self.import_path is None:
@@ -757,7 +783,11 @@ class MapPanel(QtWidgets.QGroupBox):
 
     def pick(self, x, y, yaw):
         self.stop_manual()
-        if not self.editable() or not self.live:
+        can_edit = (
+            self.goal_editable()
+            if self.view.mode == 'goal' else self.editable()
+        )
+        if not can_edit or not self.live:
             if not self.live:
                 self.status.setText('미리보기 지도에서는 이동 불가. Nav2에 지도를 먼저 적용하세요.')
             return
@@ -805,7 +835,8 @@ class MapPanel(QtWidgets.QGroupBox):
         if self.require_initial:
             self.status.setText('지도를 변경했습니다. 초기 위치를 먼저 지정하세요.')
             return
-        if self.editable() and self.bridge and self.live and self.view.waypoints:
+        if (self.goal_editable() and self.bridge and self.live
+                and self.view.waypoints):
             if self.home_pose is None:
                 pose = getattr(self.bridge, 'pose', None)
                 if pose is None:
@@ -824,7 +855,7 @@ class MapPanel(QtWidgets.QGroupBox):
         if self.require_initial:
             self.status.setText('지도를 변경했습니다. 초기 위치를 먼저 지정하세요.')
             return
-        if not self.editable() or not self.bridge or not self.live:
+        if not self.goal_editable() or not self.bridge or not self.live:
             return
         if self.home_pose is None:
             self.status.setText(

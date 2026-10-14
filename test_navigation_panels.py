@@ -149,6 +149,45 @@ class MapTests(unittest.TestCase):
         self.assertEqual(panel.home_pose, (.25, -.5, .1))
         bridge.publish_goal_pose.assert_called_once_with((1.5, .5, 0.0))
 
+    def test_custom_pure_pursuit_busy_allows_new_goal_pick_and_send(self):
+        bridge=SimpleNamespace(
+            busy=True, nav_busy=False, custom_drive_busy=True,
+            pose=(.25, -.5, .1), follow=Mock(),
+            publish_goal_pose=Mock(), initial_pose=Mock(),
+            mapReceived=Mock(), poseReceived=Mock(), planReceived=Mock(),
+            navStatus=Mock())
+        panel=MapPanel(bridge, Mock())
+        panel.view.set_map(MapData([[0, 0], [0, 0]], 1, (0, 0, 0)))
+        panel.live=True
+        panel.view.mode='goal'
+
+        panel.pick(.5, .5, 0.0)
+        panel.start_v3_goal()
+
+        self.assertEqual(panel.view.waypoints, [(.5, .5, 0.0)])
+        bridge.publish_goal_pose.assert_called_once_with((.5, .5, 0.0))
+
+    def test_nav2_busy_still_blocks_v3_goal_pick_and_send(self):
+        bridge=SimpleNamespace(
+            busy=True, nav_busy=True, custom_drive_busy=False,
+            pose=(.25, -.5, .1), follow=Mock(),
+            publish_goal_pose=Mock(), initial_pose=Mock(),
+            mapReceived=Mock(), poseReceived=Mock(), planReceived=Mock(),
+            navStatus=Mock())
+        panel=MapPanel(bridge, Mock())
+        panel.view.set_map(MapData([[0, 0], [0, 0]], 1, (0, 0, 0)))
+        panel.live=True
+        panel.view.mode='goal'
+
+        panel.pick(.5, .5, 0.0)
+        self.assertEqual(panel.view.waypoints, [])
+
+        panel.view.waypoints=[(.5, .5, 0.0)]
+        panel.start_v3_goal()
+
+        bridge.publish_goal_pose.assert_not_called()
+        self.assertIn('Nav2', panel.status.text())
+
     def test_first_v3_goal_without_pose_is_blocked(self):
         bridge=SimpleNamespace(
             busy=False, pose=None, follow=Mock(), publish_goal_pose=Mock(),
