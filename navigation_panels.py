@@ -18,7 +18,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from rclpy.time import Time
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from action_msgs.srv import CancelGoal
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid, Path as NavPath
 from nav2_msgs.action import FollowWaypoints
 from nav2_msgs.srv import LoadMap, ManageLifecycleNodes
@@ -223,6 +223,8 @@ class RosBridge(QtCore.QObject):
         self.initial_pub = node.create_publisher(PoseWithCovarianceStamped, self.endpoint('initialpose'), 1)
         self.goal_pose_pub = node.create_publisher(
             PoseStamped, self.endpoint('goal_pose'), 1)
+        self.goal_poses_pub = node.create_publisher(
+            PoseArray, self.endpoint('goal_poses'), 1)
         self.buffer = Buffer(node=node)
         self.listener = TransformListener(self.buffer, node, spin_thread=False)
         durable = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -278,7 +280,8 @@ class RosBridge(QtCore.QObject):
 
     @staticmethod
     def is_autonomous_driver(node_name):
-        return 'pure_pursuit' in node_name.rsplit('/', 1)[-1]
+        basename = node_name.rsplit('/', 1)[-1]
+        return 'pure_pursuit' in basename or basename == 'astar_drive'
 
     def owns_autonomous_driver(self, node_name):
         """Return whether a driver belongs to the selected robot namespace."""
@@ -319,7 +322,7 @@ class RosBridge(QtCore.QObject):
             self.driverStateReceived.emit(node_name, None)
 
     def refresh_autonomous_drivers(self):
-        """Discover Pure Pursuit nodes and query their drive lock."""
+        """Discover supported autonomous drivers and query their drive lock."""
         services = self.node.get_service_names_and_types()
         suffix = '/set_parameters_atomically'
         service_type = 'rcl_interfaces/srv/SetParametersAtomically'
@@ -394,7 +397,7 @@ class RosBridge(QtCore.QObject):
                   timeout=3)
 
     def disable_autonomous_drive(self):
-        """Atomically disable every discovered Pure Pursuit cmd_vel source."""
+        """Atomically disable every discovered autonomous cmd_vel source."""
         self.refresh_autonomous_drivers()
         had_pending = bool(self.driver_stop_pending)
         targets = [name for name, enabled in self.autonomous_drivers.items()
@@ -434,6 +437,46 @@ class RosBridge(QtCore.QObject):
         self.navStatus.emit(
             f'자동주행 정지 요청 중: {len(targets)}개 제어 노드')
         return True
+
+    def enable_autonomous_drive(self):
+        """Resume supported autonomous drivers after manual control ends."""
+        self.refresh_autonomous_drivers()
+        targets = [
+            name for name, enabled in self.autonomous_drivers.items()
+            if enabled is False and name not in self.driver_stop_pending
+        ]
+        for node_name in targets:
+            request = SetParametersAtomically.Request()
+            request.parameters = [Parameter(
+                'drive_enabled', value=True).to_parameter_msg()]
+            self.driver_generations[node_name] = (
+                self.driver_generations.get(node_name, 0) + 1)
+            self.autonomous_drivers[node_name] = None
+            self.driver_stop_pending.add(node_name)
+
+            def done(result, error, node_name=node_name):
+                self.driver_stop_pending.discard(node_name)
+                successful = bool(
+                    result and result.result and result.result.successful)
+                self.autonomous_drivers[node_name] = (
+                    True if successful else None)
+                if successful:
+                    self.navStatus.emit(
+                        f'{node_name} 자동주행 재개: 기존 경로를 이어갑니다.')
+                else:
+                    reason = error or (
+                        result.result.reason if result and result.result else
+                        '응답 없음')
+                    self.navStatus.emit(
+                        f'{node_name} 자동주행 재개 실패: {reason}')
+
+            self.call(SetParametersAtomically,
+                      node_name + '/set_parameters_atomically', request, done,
+                      timeout=3)
+        if targets:
+            self.navStatus.emit(
+                f'자동주행 재개 요청 중: {len(targets)}개 제어 노드')
+        return bool(targets)
 
     def on_action_status(self, name, msg):
         self.external_active[name] = any(s.status in (1, 2, 3) for s in msg.status_list)
@@ -522,6 +565,28 @@ class RosBridge(QtCore.QObject):
             f'yaw={math.degrees(yaw):.0f}°. 경로 확인 후 drive_enabled=true')
         return True
 
+    def publish_goal_poses(self, points):
+        """Publish ordered map-frame waypoints for the A* route follower."""
+        if self.node.count_subscribers(self.goal_poses_pub.topic_name) < 1:
+            self.navStatus.emit(
+                'A* 경유점 수신 노드가 없습니다. A* 주행 노드를 먼저 실행하세요.')
+            return False
+
+        message = PoseArray()
+        message.header.frame_id = self.frame
+        message.header.stamp = self.node.get_clock().now().to_msg()
+        for x, y, yaw in points:
+            pose = Pose()
+            pose.position.x = float(x)
+            pose.position.y = float(y)
+            pose.orientation.z = math.sin(float(yaw) / 2.0)
+            pose.orientation.w = math.cos(float(yaw) / 2.0)
+            message.poses.append(pose)
+        self.goal_poses_pub.publish(message)
+        self.navStatus.emit(
+            f'A* 다중 경로 전송: {len(message.poses)}개 경유점')
+        return True
+
     def follow(self, points):
         if self.busy:
             self.navStatus.emit('이미 이동 중입니다. 취소 완료 후 다시 실행하세요.')
@@ -608,13 +673,14 @@ class MapPanel(QtWidgets.QGroupBox):
         self.live = False
         self.loading = False
         self.require_initial = False
+        self.pending_initial = None
         # HOME is the map-frame pose at which the current run starts.  It is
         # set explicitly with Initial Pose, or lazily from TF when the first
         # V3 goal is sent.  Keep it in the controller so a HOME request is
         # still available after the V3 node has discarded its current path.
         self.home_pose = None
         self.view = MapView()
-        self.status = QtWidgets.QLabel('Nav2를 실행하면 /map을 표시합니다.')
+        self.status = QtWidgets.QLabel('SLAM 또는 지도 서버의 /map을 기다리는 중입니다.')
         self.status.setWordWrap(True)
         self.pose_status = QtWidgets.QLabel('로봇 위치: TF 대기')
         self.count_label = QtWidgets.QLabel('경유점 0개')
@@ -637,6 +703,7 @@ class MapPanel(QtWidgets.QGroupBox):
         layout.addWidget(self.view, 1)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(make_button('Goal 전송', self.start_v3_goal))
+        row.addWidget(make_button('A* 경유점 전송', self.start_astar_route))
         self.home_button = make_button('HOME 복귀', self.return_home)
         row.addWidget(self.home_button)
         row.addWidget(make_button('경로점 순회 시작', self.start_route))
@@ -644,7 +711,7 @@ class MapPanel(QtWidgets.QGroupBox):
         layout.addLayout(row)
         layout.addWidget(self.pose_status)
         layout.addWidget(self.status)
-        hint = QtWidgets.QLabel('클릭→드래그: 위치·방향 지정 | 휠: 확대 | 파란 점선: 순서 / 초록선: Nav2 경로')
+        hint = QtWidgets.QLabel('클릭→드래그: 위치·방향 지정 | A* 경유점 전송: 선택 순서대로 A* 추종 | 경로점 순회 시작: Nav2 전용 | 휠: 확대')
         hint.setWordWrap(True)
         layout.addWidget(hint)
         self.view.posePicked.connect(self.pick)
@@ -695,6 +762,72 @@ class MapPanel(QtWidgets.QGroupBox):
                     '지정하세요.')
                 return False
         return True
+
+    def initial_editable(self):
+        """Allow localization after safely stopping a custom cmd_vel driver."""
+        if self.loading:
+            self.status.setText('지도 변경 중입니다. 완료 후 초기 위치를 지정하세요.')
+            return False
+        if self.bridge:
+            nav_busy = getattr(self.bridge, 'nav_busy', None)
+            if nav_busy is None:
+                nav_busy = (
+                    bool(getattr(self.bridge, 'busy', False))
+                    and not bool(getattr(
+                        self.bridge, 'custom_drive_busy', False))
+                )
+            if nav_busy:
+                self.status.setText(
+                    'Nav2 이동 중입니다. 이동을 취소한 뒤 초기 위치를 '
+                    '지정하세요.')
+                return False
+        return True
+
+    def publish_initial(self, x, y, yaw):
+        """Publish one initial pose and record the same pose as HOME."""
+        self.bridge.initial_pose(x, y, yaw)
+        self.home_pose = (float(x), float(y), float(yaw))
+        self.require_initial = False
+        self.status.setText(
+            f'초기 위치/HOME 전송: ({x:.2f}, {y:.2f}). '
+            '로봇 표시를 확인하세요.')
+
+    def finish_pending_initial(self):
+        """Wait for an autonomous driver to stop before resetting AMCL."""
+        if self.pending_initial is None or not self.bridge:
+            return
+        x, y, yaw, deadline = self.pending_initial
+        if getattr(self.bridge, 'nav_busy', False):
+            self.pending_initial = None
+            self.status.setText(
+                'Nav2 이동이 시작되어 초기 위치 전송을 취소했습니다.')
+            return
+        if not getattr(self.bridge, 'custom_drive_busy', False):
+            self.pending_initial = None
+            self.publish_initial(x, y, yaw)
+            return
+        if time.monotonic() >= deadline:
+            self.pending_initial = None
+            self.status.setText(
+                '자동주행 정지 확인 시간 초과. 이동 취소 후 다시 지정하세요.')
+            return
+        QtCore.QTimer.singleShot(100, self.finish_pending_initial)
+
+    def request_initial(self, x, y, yaw):
+        """Stop A*/Pure Pursuit first, then publish the selected AMCL pose."""
+        if not getattr(self.bridge, 'custom_drive_busy', False):
+            self.publish_initial(x, y, yaw)
+            return
+        disable = getattr(self.bridge, 'disable_autonomous_drive', None)
+        if not callable(disable) or not disable():
+            self.status.setText(
+                '자동주행을 정지하지 못했습니다. 이동 취소 후 다시 지정하세요.')
+            return
+        self.pending_initial = (
+            float(x), float(y), float(yaw), time.monotonic() + 4.0)
+        self.status.setText(
+            'A*/Pure Pursuit 정지 확인 중 — 확인 후 초기 위치를 자동 전송합니다.')
+        QtCore.QTimer.singleShot(100, self.finish_pending_initial)
 
     def on_map(self, data):
         self.latest_map = data
@@ -783,10 +916,12 @@ class MapPanel(QtWidgets.QGroupBox):
 
     def pick(self, x, y, yaw):
         self.stop_manual()
-        can_edit = (
-            self.goal_editable()
-            if self.view.mode == 'goal' else self.editable()
-        )
+        if self.view.mode == 'goal':
+            can_edit = self.goal_editable()
+        elif self.view.mode == 'initial':
+            can_edit = self.initial_editable()
+        else:
+            can_edit = self.editable()
         if not can_edit or not self.live:
             if not self.live:
                 self.status.setText('미리보기 지도에서는 이동 불가. Nav2에 지도를 먼저 적용하세요.')
@@ -795,12 +930,7 @@ class MapPanel(QtWidgets.QGroupBox):
             self.status.setText('장애물/미확인/지도 밖입니다. 빈 공간을 선택하세요.')
             return
         if self.view.mode == 'initial' and self.bridge:
-            self.bridge.initial_pose(x, y, yaw)
-            self.home_pose = (float(x), float(y), float(yaw))
-            self.require_initial = False
-            self.status.setText(
-                f'초기 위치/HOME 전송: ({x:.2f}, {y:.2f}). '
-                '로봇 표시를 확인하세요.')
+            self.request_initial(x, y, yaw)
         elif self.view.mode == 'goal':
             self.view.waypoints.append((x, y, yaw))
             self.count_label.setText(f'경유점 {len(self.view.waypoints)}개')
@@ -848,6 +978,18 @@ class MapPanel(QtWidgets.QGroupBox):
             self.bridge.publish_goal_pose(self.view.waypoints[-1])
         elif not self.view.waypoints:
             self.status.setText('목표점을 먼저 추가하세요.')
+
+    def start_astar_route(self):
+        """Send every selected waypoint to the A* sequential route follower."""
+        self.stop_manual()
+        if self.require_initial:
+            self.status.setText('지도를 변경했습니다. 초기 위치를 먼저 지정하세요.')
+            return
+        if not self.view.waypoints:
+            self.status.setText('A* 경유점을 먼저 추가하세요.')
+            return
+        if self.goal_editable() and self.bridge and self.live:
+            self.bridge.publish_goal_poses(list(self.view.waypoints))
 
     def return_home(self):
         """Replace the current V3 goal with the recorded start pose."""

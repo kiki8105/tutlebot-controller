@@ -126,7 +126,8 @@ class CameraFeed:
 
 class Controller(QtWidgets.QWidget):
     vehicleRequested = QtCore.pyqtSignal(str)
-    def __init__(self, publisher, domain_id=None, settings=None, camera=None, node=None):
+    def __init__(self, publisher, domain_id=None, settings=None, camera=None,
+                 node=None, camera_topic=None):
         super().__init__()
         self.publisher = publisher
         self.camera = camera
@@ -137,6 +138,7 @@ class Controller(QtWidgets.QWidget):
         self.domain_id = initial_domain(self.settings) if domain_id is None else domain_id
         self.keys = set()
         self.active = None
+        self.manual_override_active = False
         self.direction = (0, 0)
         self.stop_ticks = 0
         self.setWindowTitle('TurtleBot3 · 카메라 / 파라미터 / 지도 / 조종')
@@ -183,7 +185,11 @@ class Controller(QtWidgets.QWidget):
         self.camera_topic.setEditable(True)
         self.camera_settings_prefix = (f'vehicles/{self.domain_id}/{self.vehicle_namespace.strip(chr(47))}/camera/'
                                        if self.vehicle_namespace else 'camera/')
-        self.camera_topic.addItem(str(self.settings.value(self.camera_settings_prefix+'topic', self.vehicle_namespace+'/camera/image_raw')))
+        saved_camera_topic = self.settings.value(
+            self.camera_settings_prefix + 'topic',
+            self.vehicle_namespace + '/camera/image_raw',
+        )
+        self.camera_topic.addItem(camera_topic or str(saved_camera_topic))
         row.addWidget(self.camera_topic, 1)
         refresh = QtWidgets.QPushButton('토픽 검색')
         refresh.setStyleSheet('min-height: 32px; padding: 4px;')
@@ -275,7 +281,8 @@ class Controller(QtWidgets.QWidget):
             button.setMinimumHeight(46)
             button.setFocusPolicy(QtCore.Qt.NoFocus)
             button.pressed.connect(lambda b=button, d=direction: self.start(b, d))
-            button.released.connect(self.stop)
+            button.released.connect(
+                lambda: self.stop(resume_autonomous=True))
             grid.addWidget(button, row, col)
             self.buttons[name] = button
         stop_button = QtWidgets.QPushButton('■ 정지')
@@ -328,7 +335,7 @@ class Controller(QtWidgets.QWidget):
                 if self.keys:
                     self.direction = self.combine(directions[k] for k in self.keys)
                 else:
-                    self.stop()
+                    self.stop(resume_autonomous=True)
             return False
         editing = isinstance(obj, (QtWidgets.QLineEdit, QtWidgets.QAbstractSpinBox,
                                    QtWidgets.QComboBox))
@@ -346,6 +353,7 @@ class Controller(QtWidgets.QWidget):
             # Holding ↑/↓ and pressing ←/→ combines into an arc turn.
             self.keys.add(key)
             self.direction = self.combine(directions[k] for k in self.keys)
+            self.manual_override_active = True
             self.stop_ticks = 0
             self.tick()
         return True
@@ -457,6 +465,10 @@ class Controller(QtWidgets.QWidget):
             cancel = getattr(self.bridge, 'cancel', None)
             if callable(cancel):
                 cancel()
+            disable = getattr(self.bridge, 'disable_autonomous_drive', None)
+            if callable(disable):
+                disable()
+        self.manual_override_active = False
         self.stop()
         self.publish()
 
@@ -489,10 +501,11 @@ class Controller(QtWidgets.QWidget):
             return
         self.keys.clear()
         self.active, self.direction = button, direction
+        self.manual_override_active = True
         self.stop_ticks = 0
         self.tick()
 
-    def stop(self):
+    def stop(self, resume_autonomous=False):
         was_manual = bool(self.keys or self.active is not None)
         self.keys.clear()
         self.active = None
@@ -501,6 +514,15 @@ class Controller(QtWidgets.QWidget):
             self.publish()
         self.stop_ticks = 5  # Short stop burst; do not continuously compete when idle.
         self.status.setText('정지')
+        if resume_autonomous and self.manual_override_active:
+            self.manual_override_active = False
+            QtCore.QTimer.singleShot(300, self.resume_autonomous)
+
+    def resume_autonomous(self):
+        if self.bridge:
+            enable = getattr(self.bridge, 'enable_autonomous_drive', None)
+            if callable(enable):
+                enable()
 
     def tick(self):
         if self.bridge and self.bridge.busy:
@@ -513,7 +535,7 @@ class Controller(QtWidgets.QWidget):
             return
         if self.keys or self.active is not None:
             if not self.keys and not self.active.isDown():
-                self.stop()
+                self.stop(resume_autonomous=True)
                 return
             linear = self.direction[0] * self.linear_speed.value()
             angular = self.direction[1] * self.angular_speed.value()
@@ -525,10 +547,10 @@ class Controller(QtWidgets.QWidget):
 
     def application_state_changed(self, state):
         if state != QtCore.Qt.ApplicationActive:
-            self.stop()
+            self.stop(resume_autonomous=True)
 
     def hideEvent(self, event):
-        self.stop()
+        self.stop(resume_autonomous=True)
         super().hideEvent(event)
 
     def closeEvent(self, event):
@@ -557,6 +579,7 @@ def main():
     parser.add_argument('--domain-id', type=int, choices=range(233), metavar='0..232',
                         help='저장된 ID보다 우선하여 이번 실행의 ROS Domain 지정')
     parser.add_argument('--robot-namespace', help='연결할 차량 namespace (예: /robot1)')
+    parser.add_argument('--camera-topic', help='시작 시 연결할 ROS Image 토픽')
     options, ros_args = parser.parse_known_args()
     domain_id = initial_domain(settings) if options.domain_id is None else options.domain_id
     os.environ['ROS_DOMAIN_ID'] = str(domain_id)
@@ -572,7 +595,14 @@ def main():
     app = QtWidgets.QApplication([sys.argv[0]])
     app.setQuitOnLastWindowClosed(False)
     camera = CameraFeed()
-    window = Controller(publisher, domain_id, settings, camera, node)
+    window = Controller(
+        publisher,
+        domain_id,
+        settings,
+        camera,
+        node,
+        camera_topic=options.camera_topic,
+    )
     # RosBridge가 /map 등의 구독과 Qt signal 연결을 모두 만든 뒤 executor를
     # 시작한다. 먼저 spin하면 durable /map이 패널 연결 전에 한 번 도착해
     # 화면에서 유실될 수 있다.
@@ -629,8 +659,17 @@ def main():
         node.destroy_node()
         rclpy.try_shutdown()
     if restart_namespace is not None:
-        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), '--domain-id', str(domain_id),
-                                 '--robot-namespace', restart_namespace]+ros_args)
+        restart_args = [
+            sys.executable,
+            os.path.abspath(__file__),
+            '--domain-id',
+            str(domain_id),
+            '--robot-namespace',
+            restart_namespace,
+        ]
+        if options.camera_topic:
+            restart_args.extend(['--camera-topic', options.camera_topic])
+        os.execv(sys.executable, restart_args + ros_args)
     return result
 
 

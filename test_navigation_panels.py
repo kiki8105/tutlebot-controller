@@ -133,6 +133,49 @@ class MapTests(unittest.TestCase):
             (.5, .5, math.pi/4))
         self.assertIn('HOME 복귀 목표 전송', panel.status.text())
 
+    def test_initial_pose_stops_astar_before_amcl_reset(self):
+        bridge=SimpleNamespace(
+            busy=True, nav_busy=False, custom_drive_busy=True,
+            disable_autonomous_drive=Mock(return_value=True),
+            pose=None, follow=Mock(), publish_goal_pose=Mock(),
+            initial_pose=Mock(), mapReceived=Mock(), poseReceived=Mock(),
+            planReceived=Mock(), navStatus=Mock())
+        panel=MapPanel(bridge, Mock())
+        panel.view.set_map(MapData([[0, 0], [0, 0]], 1, (0, 0, 0)))
+        panel.live=True
+        panel.view.mode='initial'
+
+        with patch.object(QtCore.QTimer, 'singleShot') as retry:
+            panel.pick(.5, .5, math.pi/4)
+
+        bridge.disable_autonomous_drive.assert_called_once_with()
+        bridge.initial_pose.assert_not_called()
+        self.assertIsNotNone(panel.pending_initial)
+        retry.assert_called_once()
+
+        bridge.custom_drive_busy=False
+        panel.finish_pending_initial()
+
+        bridge.initial_pose.assert_called_once_with(.5, .5, math.pi/4)
+        self.assertEqual(panel.home_pose, (.5, .5, math.pi/4))
+        self.assertIsNone(panel.pending_initial)
+
+    def test_nav2_busy_blocks_initial_pose_reset(self):
+        bridge=SimpleNamespace(
+            busy=True, nav_busy=True, custom_drive_busy=False,
+            pose=None, follow=Mock(), publish_goal_pose=Mock(),
+            initial_pose=Mock(), mapReceived=Mock(), poseReceived=Mock(),
+            planReceived=Mock(), navStatus=Mock())
+        panel=MapPanel(bridge, Mock())
+        panel.view.set_map(MapData([[0, 0], [0, 0]], 1, (0, 0, 0)))
+        panel.live=True
+        panel.view.mode='initial'
+
+        panel.pick(.5, .5, 0.0)
+
+        bridge.initial_pose.assert_not_called()
+        self.assertIn('Nav2', panel.status.text())
+
     def test_first_v3_goal_uses_current_tf_as_home_fallback(self):
         bridge=SimpleNamespace(
             busy=False, pose=(.25, -.5, .1), follow=Mock(),

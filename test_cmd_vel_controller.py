@@ -4,7 +4,12 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from PyQt5 import QtCore, QtWidgets
-from cmd_vel_controller import Controller, domain_settings, initial_domain
+from cmd_vel_controller import (
+    Controller,
+    RosBridge,
+    domain_settings,
+    initial_domain,
+)
 
 
 class Publisher:
@@ -40,6 +45,42 @@ class ControllerTests(unittest.TestCase):
     def assert_stopped(self):
         m = self.pub.messages[-1]
         self.assertEqual((m.linear.x, m.angular.z), (0.0, 0.0))
+
+    def test_astar_waypoints_publish_as_ordered_pose_array(self):
+        from builtin_interfaces.msg import Time
+
+        publisher = Mock()
+        status = Mock()
+        clock = SimpleNamespace(
+            now=lambda: SimpleNamespace(to_msg=lambda: Time())
+        )
+        bridge = SimpleNamespace(
+            node=SimpleNamespace(
+                count_subscribers=Mock(return_value=1),
+                get_clock=lambda: clock,
+            ),
+            goal_poses_pub=SimpleNamespace(
+                topic_name='/goal_poses',
+                publish=publisher,
+            ),
+            frame='map',
+            navStatus=status,
+        )
+
+        sent = RosBridge.publish_goal_poses(
+            bridge,
+            [(1.0, 2.0, 0.0), (3.0, 4.0, 1.0)],
+        )
+
+        self.assertTrue(sent)
+        message = publisher.call_args.args[0]
+        self.assertEqual(message.header.frame_id, 'map')
+        self.assertEqual(len(message.poses), 2)
+        self.assertEqual(
+            [(pose.position.x, pose.position.y) for pose in message.poses],
+            [(1.0, 2.0), (3.0, 4.0)],
+        )
+        self.assertAlmostEqual(message.poses[1].orientation.z, 0.4794255)
 
     def test_direction_and_release(self):
         for name, expected in [('forward', (.1, 0)), ('backward', (-.1, 0)),
@@ -182,6 +223,21 @@ if __name__ == '__main__':
 
 
 class CameraPanelTests(ControllerTests):
+    def test_startup_camera_topic_overrides_saved_raw_topic(self):
+        self.settings.setValue('camera/topic', '/camera/image_raw')
+        window = Controller(
+            self.pub,
+            domain_id=64,
+            settings=self.settings,
+            camera_topic='/yolo/annotated_image',
+        )
+        self.addCleanup(window.close)
+
+        self.assertEqual(
+            window.camera_topic.currentText(),
+            '/yolo/annotated_image',
+        )
+
     def test_latest_frame_and_stale_frame(self):
         import time
         from types import SimpleNamespace
@@ -249,6 +305,27 @@ class KeyboardTests(ControllerTests):
 
         self.send_key(QtCore.Qt.Key_Up, release=True, target=self.window.map_panel.view)
         self.assert_stopped()
+
+    def test_releasing_manual_drive_resumes_autonomous_driver(self):
+        from unittest.mock import Mock, patch
+        bridge = SimpleNamespace(
+            busy=False,
+            custom_drive_busy=False,
+            enable_autonomous_drive=Mock(),
+        )
+        self.window.bridge = bridge
+        self.addCleanup(setattr, self.window, 'bridge', None)
+        self.window.keys.add(QtCore.Qt.Key_Up)
+        self.window.manual_override_active = True
+
+        with patch.object(
+                QtCore.QTimer,
+                'singleShot',
+                side_effect=lambda _delay, callback: callback()):
+            self.window.stop(resume_autonomous=True)
+
+        bridge.enable_autonomous_drive.assert_called_once_with()
+        self.assertFalse(self.window.manual_override_active)
 
     def test_arrow_disables_custom_driver_before_manual_motion(self):
         bridge = SimpleNamespace(
