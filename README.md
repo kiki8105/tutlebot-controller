@@ -6,8 +6,9 @@ ROS 2 Humble 기반 TurtleBot3 조종기입니다. 한 화면에서 카메라, R
 지도에서 단일 `/goal_pose`를 전송하거나 여러 경로점을 순서대로 보낼 수 있으며,
 초기 위치를 HOME으로 저장해 복귀 목표로 다시 전송할 수 있습니다.
 단일 Goal/HOME 기능을 쓰려면 주행 노드가 `/goal_pose`를 구독해야 합니다.
-빨간 정지 버튼과 수동 주행 입력은 조종기가 발견한 Pure Pursuit 노드의
-`drive_enabled`를 먼저 끄므로 `/cmd_vel` 발행자가 서로 충돌하지 않습니다.
+빨간 정지 버튼과 수동 주행 입력은 조종기가 발견한 Pure Pursuit 또는
+A* 주행 노드의 `drive_enabled`를 먼저 끄므로 `/cmd_vel` 발행자가 서로
+충돌하지 않습니다. A* 다중 경유점은 `/goal_poses`로 전송합니다.
 
 창을 작게 줄이면 대시보드에 스크롤바가 나타납니다. 주행 버튼과 입력 필드는
 최소 크기를 유지하므로 글자와 버튼이 눌리거나 겹치지 않습니다.
@@ -37,6 +38,19 @@ cd ~/turtlebot3/tutlebot-controller
 ```bash
 ./control_226
 ```
+
+A*·YOLO 주행 화면은 주석 영상 `/yolo/annotated_image`를 여는 view 실행
+파일을 사용합니다. 자동주행 중 방향키나 버튼을 누르면 A*를 먼저 정지하고,
+입력을 놓으면 저장된 경로 주행을 재개합니다.
+
+```bash
+./control_64_view
+./control_226_view
+```
+
+초기 위치 지정 시 A*/Pure Pursuit가 켜져 있으면 먼저
+`drive_enabled=false` 전환을 확인한 뒤 `/initialpose`를 전송합니다. Nav2
+액션이 실제로 이동 중일 때는 초기 위치 변경을 차단합니다.
 
 워크스페이스 위치가 다르면 실행 전에 지정할 수 있습니다.
 

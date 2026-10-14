@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+TURTLEBOT3_WS="${TURTLEBOT3_WS:-$HOME/turtlebot3}"
+
+source /opt/ros/humble/setup.bash
+source "$TURTLEBOT3_WS/install/setup.bash"
+set -u
+
+export ROS_DOMAIN_ID=226
+export ROS_LOCALHOST_ONLY=0
+export TURTLEBOT3_MODEL=waffle_pi
+
+# YOLO 주석 영상을 표시합니다. 수동 조작 전 A*를 정지하고,
+# 방향키/버튼 입력을 놓으면 저장된 A* 경로를 재개합니다.
+exec /usr/bin/python3 "$ROOT_DIR/cmd_vel_controller.py" \
+  --domain-id 226 \
+  --robot-namespace / \
+  --camera-topic /yolo/annotated_image \
+  "$@"
